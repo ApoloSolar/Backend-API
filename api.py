@@ -270,6 +270,35 @@ def dia(data: str):
     }
 
 
+@app.get("/dia/{data}/canais")
+def dia_canais(data: str):
+    """Canais (MPPT e strings PV) das leituras de um dia.
+    Separado de /dia para manter cada resposta enxuta. O dashboard
+    usa isto para montar os cards detalhados de cada inversor."""
+    try:
+        datetime.strptime(data, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400,
+                            detail="Data invalida. Use AAAA-MM-DD.")
+
+    inicio = datetime.strptime(data, "%Y-%m-%d").replace(tzinfo=FUSO_BRASIL)
+    fim = inicio + timedelta(days=1)
+
+    linhas = consultar("""
+        SELECT l.data_hora, i.idx, i.nome AS inversor,
+               c.tipo, c.canal, c.tensao_v, c.corrente_a, c.potencia_w
+        FROM leitura_canal c
+        JOIN leitura  l ON l.id = c.leitura_id
+        JOIN inversor i ON i.id = l.inversor_id
+        WHERE l.data_hora >= %s AND l.data_hora < %s
+        ORDER BY l.data_hora, i.idx, c.tipo, c.canal
+    """, (inicio, fim))
+
+    for l in linhas:
+        l["data_hora"] = fmt(l["data_hora"])
+    return {"data": data, "canais": linhas}
+
+
 # ============================================================
 # /checagem
 # ============================================================
