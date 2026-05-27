@@ -410,6 +410,218 @@ def dia_canais(data: str):
 
 
 # ============================================================
+# /dia/{data}/curva-inversores
+# ============================================================
+# Para o mini-grafico do card expandido: a curva de potencia
+# (pac_kw) de CADA inversor ao longo do dia.
+# E um endereco LEVE: traz apenas data_hora + pac_kw (sem os
+# canais MPPT/string), entao sao algumas centenas de linhas,
+# nao dezenas de milhares. Nao ha risco de memoria.
+
+@app.get("/dia/{data}/curva-inversores")
+def dia_curva_inversores(data: str):
+    """Serie de pac_kw de cada inversor ao longo do dia."""
+    inicio, fim = faixa_do_dia(data)
+
+    linhas = consultar("""
+        SELECT i.idx, i.nome AS inversor,
+               l.data_hora, l.pac_kw
+        FROM leitura l
+        JOIN inversor i ON i.id = l.inversor_id
+        WHERE l.data_hora >= %s AND l.data_hora < %s
+        ORDER BY i.idx, l.data_hora
+    """, (inicio, fim))
+
+    if not linhas:
+        return {"data": data, "aviso": "Nenhuma leitura neste dia.",
+                "inversores": []}
+
+    # Agrupa a serie por inversor
+    por_inversor = {}
+    for l in linhas:
+        nome = l["inversor"]
+        if nome not in por_inversor:
+            por_inversor[nome] = {"idx": l["idx"], "nome": nome, "serie": []}
+        por_inversor[nome]["serie"].append({
+            "hora": fmt(l["data_hora"]),
+            "pac_kw": l["pac_kw"] or 0.0,
+        })
+
+    saida = sorted(por_inversor.values(), key=lambda x: x["idx"])
+    return {"data": data, "inversores": saida}
+
+
+# ============================================================
+# /mensal/{aaaa-mm}
+# ============================================================
+# Le da tabela resumo_dia (alimentada pelo resumidor diario).
+# Devolve:
+#   resumo:       totais do mes (energia, pico, dias com dados)
+#   dias:         lista [{data, energia_kwh, pico_kw, pico_hora}] - 1 por dia
+#   por_inversor: lista [{idx, nome, dias:[{data,energia_kwh,pico_kw}]}] - 1 por inv
+#                 (para o "grafico em 8" do dashboard)
+
+@app.get("/mensal/{aaaa_mm}")
+def mensal(aaaa_mm: str):
+    """Resumo de um mes (ex: /mensal/2026-05)."""
+    try:
+        ano, mes = aaaa_mm.split("-")
+        ano_i, mes_i = int(ano), int(mes)
+        if not (1 <= mes_i <= 12):
+            raise ValueError("mes fora de 1-12")
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400,
+                            detail="Formato invalido. Use AAAA-MM.")
+
+    # Janela [inicio, fim) de datas
+    from datetime import date as _date
+    inicio = _date(ano_i, mes_i, 1)
+    fim = _date(ano_i + (1 if mes_i == 12 else 0),
+                1 if mes_i == 12 else mes_i + 1, 1)
+
+    # ---- dias (curva do mes) ----
+    dias = consultar("""
+        SELECT data, energia_kwh, pico_kw, pico_hora, inversores_no_dia
+        FROM resumo_dia
+        WHERE data >= %s AND data < %s
+        ORDER BY data
+    """, (inicio, fim))
+
+    if not dias:
+        return {"mes": aaaa_mm, "aviso": "Nenhum resumo para este mes.",
+                "dias": [], "resumo": None, "por_inversor": []}
+
+    # ---- resumo do mes ----
+    energia_total = sum(float(d["energia_kwh"] or 0) for d in dias)
+    pico_obj = max(dias, key=lambda d: float(d["pico_kw"] or 0))
+
+    for d in dias:
+        d["data"]        = d["data"].isoformat()
+        d["energia_kwh"] = float(d["energia_kwh"] or 0)
+        d["pico_kw"]     = float(d["pico_kw"] or 0)
+        d["pico_hora"]   = d["pico_hora"].strftime("%H:%M") if d["pico_hora"] else None
+
+    # ---- por inversor (para o grafico em 8) ----
+    por_inv_linhas = consultar("""
+        SELECT i.idx, i.nome, r.data, r.energia_kwh, r.pico_kw, r.pico_hora
+        FROM resumo_dia_inversor r
+        JOIN inversor i ON i.id = r.inversor_id
+        WHERE r.data >= %s AND r.data < %s
+        ORDER BY i.idx, r.data
+    """, (inicio, fim))
+
+    por_inv_map = {}
+    for l in por_inv_linhas:
+        nome = l["nome"]
+        if nome not in por_inv_map:
+            por_inv_map[nome] = {"idx": l["idx"], "nome": nome, "dias": []}
+        por_inv_map[nome]["dias"].append({
+            "data":        l["data"].isoformat(),
+            "energia_kwh": float(l["energia_kwh"] or 0),
+            "pico_kw":     float(l["pico_kw"] or 0),
+            "pico_hora":   l["pico_hora"].strftime("%H:%M") if l["pico_hora"] else None,
+        })
+    por_inversor = sorted(por_inv_map.values(), key=lambda x: x["idx"])
+
+    return {
+        "mes": aaaa_mm,
+        "resumo": {
+            "energia_kwh": round(energia_total, 2),
+            "pico_kw":     float(pico_obj["pico_kw"]),
+            "pico_data":   pico_obj["data"],
+            "pico_hora":   pico_obj["pico_hora"],
+            "dias_com_dados": len(dias),
+        },
+        "dias": dias,
+        "por_inversor": por_inversor,
+    }
+
+
+# ============================================================
+# /anual/{aaaa}
+# ============================================================
+# Agrega resumo_dia em 12 meses do ano. Devolve:
+#   resumo:       totais do ano
+#   meses:        lista [{mes:1..12, energia_kwh, pico_kw}]
+#   por_inversor: lista [{idx, nome, meses:[{mes,energia_kwh,pico_kw}]}]
+
+@app.get("/anual/{aaaa}")
+def anual(aaaa: str):
+    """Resumo de um ano (ex: /anual/2026)."""
+    try:
+        ano_i = int(aaaa)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400,
+                            detail="Ano invalido. Use AAAA.")
+
+    from datetime import date as _date
+    inicio = _date(ano_i, 1, 1)
+    fim    = _date(ano_i + 1, 1, 1)
+
+    # ---- meses (curva do ano) ----
+    # Agrega resumo_dia por mes
+    meses = consultar("""
+        SELECT EXTRACT(MONTH FROM data)::int AS mes,
+               SUM(energia_kwh)              AS energia,
+               MAX(pico_kw)                  AS pico,
+               COUNT(*)                      AS dias_com_dados
+        FROM resumo_dia
+        WHERE data >= %s AND data < %s
+        GROUP BY EXTRACT(MONTH FROM data)
+        ORDER BY mes
+    """, (inicio, fim))
+
+    if not meses:
+        return {"ano": aaaa, "aviso": "Nenhum dado para este ano.",
+                "meses": [], "resumo": None, "por_inversor": []}
+
+    for m in meses:
+        m["energia_kwh"]    = float(m.pop("energia") or 0)
+        m["pico_kw"]        = float(m.pop("pico") or 0)
+        m["dias_com_dados"] = m["dias_com_dados"]
+
+    energia_ano = sum(m["energia_kwh"] for m in meses)
+    pico_obj = max(meses, key=lambda m: m["pico_kw"])
+
+    # ---- por inversor ----
+    por_inv_linhas = consultar("""
+        SELECT i.idx, i.nome,
+               EXTRACT(MONTH FROM r.data)::int AS mes,
+               SUM(r.energia_kwh)              AS energia,
+               MAX(r.pico_kw)                  AS pico
+        FROM resumo_dia_inversor r
+        JOIN inversor i ON i.id = r.inversor_id
+        WHERE r.data >= %s AND r.data < %s
+        GROUP BY i.idx, i.nome, EXTRACT(MONTH FROM r.data)
+        ORDER BY i.idx, mes
+    """, (inicio, fim))
+
+    por_inv_map = {}
+    for l in por_inv_linhas:
+        nome = l["nome"]
+        if nome not in por_inv_map:
+            por_inv_map[nome] = {"idx": l["idx"], "nome": nome, "meses": []}
+        por_inv_map[nome]["meses"].append({
+            "mes":         l["mes"],
+            "energia_kwh": float(l["energia"] or 0),
+            "pico_kw":     float(l["pico"] or 0),
+        })
+    por_inversor = sorted(por_inv_map.values(), key=lambda x: x["idx"])
+
+    return {
+        "ano": aaaa,
+        "resumo": {
+            "energia_kwh":     round(energia_ano, 2),
+            "pico_kw":         pico_obj["pico_kw"],
+            "pico_mes":        pico_obj["mes"],
+            "meses_com_dados": len(meses),
+        },
+        "meses": meses,
+        "por_inversor": por_inversor,
+    }
+
+
+# ============================================================
 # /checagem
 # ============================================================
 
