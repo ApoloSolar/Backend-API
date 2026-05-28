@@ -481,7 +481,8 @@ def mensal(aaaa_mm: str):
 
     # ---- dias (curva do mes) ----
     dias = consultar("""
-        SELECT data, energia_kwh, pico_kw, pico_hora, inversores_no_dia
+        SELECT data, energia_kwh, pac_medio_kw, pico_kw, pico_hora,
+               insolacao_h, inversores_no_dia
         FROM resumo_dia
         WHERE data >= %s AND data < %s
         ORDER BY data
@@ -494,16 +495,22 @@ def mensal(aaaa_mm: str):
     # ---- resumo do mes ----
     energia_total = sum(float(d["energia_kwh"] or 0) for d in dias)
     pico_obj = max(dias, key=lambda d: float(d["pico_kw"] or 0))
+    # soma de insolacao (ignora dias sem dado)
+    insol_valores = [float(d["insolacao_h"]) for d in dias if d["insolacao_h"] is not None]
+    insol_total = round(sum(insol_valores), 1) if insol_valores else None
 
     for d in dias:
-        d["data"]        = d["data"].isoformat()
-        d["energia_kwh"] = float(d["energia_kwh"] or 0)
-        d["pico_kw"]     = float(d["pico_kw"] or 0)
-        d["pico_hora"]   = d["pico_hora"].strftime("%H:%M") if d["pico_hora"] else None
+        d["data"]         = d["data"].isoformat()
+        d["energia_kwh"]  = float(d["energia_kwh"] or 0)
+        d["pac_medio_kw"] = float(d["pac_medio_kw"]) if d["pac_medio_kw"] is not None else 0.0
+        d["pico_kw"]      = float(d["pico_kw"] or 0)
+        d["pico_hora"]    = d["pico_hora"].strftime("%H:%M") if d["pico_hora"] else None
+        d["insolacao_h"]  = float(d["insolacao_h"]) if d["insolacao_h"] is not None else None
 
-    # ---- por inversor (para o grafico em 8) ----
+    # ---- por inversor (para o grafico em 8 + heatmap de disponibilidade) ----
     por_inv_linhas = consultar("""
-        SELECT i.idx, i.nome, r.data, r.energia_kwh, r.pico_kw, r.pico_hora
+        SELECT i.idx, i.nome, r.data, r.energia_kwh, r.pico_kw, r.pico_hora,
+               r.disponibilidade
         FROM resumo_dia_inversor r
         JOIN inversor i ON i.id = r.inversor_id
         WHERE r.data >= %s AND r.data < %s
@@ -516,20 +523,22 @@ def mensal(aaaa_mm: str):
         if nome not in por_inv_map:
             por_inv_map[nome] = {"idx": l["idx"], "nome": nome, "dias": []}
         por_inv_map[nome]["dias"].append({
-            "data":        l["data"].isoformat(),
-            "energia_kwh": float(l["energia_kwh"] or 0),
-            "pico_kw":     float(l["pico_kw"] or 0),
-            "pico_hora":   l["pico_hora"].strftime("%H:%M") if l["pico_hora"] else None,
+            "data":            l["data"].isoformat(),
+            "energia_kwh":     float(l["energia_kwh"] or 0),
+            "pico_kw":         float(l["pico_kw"] or 0),
+            "pico_hora":       l["pico_hora"].strftime("%H:%M") if l["pico_hora"] else None,
+            "disponibilidade": float(l["disponibilidade"]) if l["disponibilidade"] is not None else 0.0,
         })
     por_inversor = sorted(por_inv_map.values(), key=lambda x: x["idx"])
 
     return {
         "mes": aaaa_mm,
         "resumo": {
-            "energia_kwh": round(energia_total, 2),
-            "pico_kw":     float(pico_obj["pico_kw"]),
-            "pico_data":   pico_obj["data"],
-            "pico_hora":   pico_obj["pico_hora"],
+            "energia_kwh":    round(energia_total, 2),
+            "pico_kw":        float(pico_obj["pico_kw"]),
+            "pico_data":      pico_obj["data"],
+            "pico_hora":      pico_obj["pico_hora"],
+            "insolacao_h":    insol_total,
             "dias_com_dados": len(dias),
         },
         "dias": dias,
@@ -564,6 +573,7 @@ def anual(aaaa: str):
         SELECT EXTRACT(MONTH FROM data)::int AS mes,
                SUM(energia_kwh)              AS energia,
                MAX(pico_kw)                  AS pico,
+               SUM(insolacao_h)              AS insolacao,
                COUNT(*)                      AS dias_com_dados
         FROM resumo_dia
         WHERE data >= %s AND data < %s
@@ -578,6 +588,8 @@ def anual(aaaa: str):
     for m in meses:
         m["energia_kwh"]    = float(m.pop("energia") or 0)
         m["pico_kw"]        = float(m.pop("pico") or 0)
+        ins = m.pop("insolacao")
+        m["insolacao_h"]    = float(ins) if ins is not None else None
         m["dias_com_dados"] = m["dias_com_dados"]
 
     energia_ano = sum(m["energia_kwh"] for m in meses)
