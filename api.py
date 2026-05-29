@@ -510,7 +510,7 @@ def mensal(aaaa_mm: str):
     # ---- por inversor (para o grafico em 8 + heatmap de disponibilidade) ----
     por_inv_linhas = consultar("""
         SELECT i.idx, i.nome, r.data, r.energia_kwh, r.pico_kw, r.pico_hora,
-               r.disponibilidade
+               r.disponibilidade, r.pac_medio_6_18_kw
         FROM resumo_dia_inversor r
         JOIN inversor i ON i.id = r.inversor_id
         WHERE r.data >= %s AND r.data < %s
@@ -528,6 +528,7 @@ def mensal(aaaa_mm: str):
             "pico_kw":         float(l["pico_kw"] or 0),
             "pico_hora":       l["pico_hora"].strftime("%H:%M") if l["pico_hora"] else None,
             "disponibilidade": float(l["disponibilidade"]) if l["disponibilidade"] is not None else 0.0,
+            "pac_medio_kw":    float(l["pac_medio_6_18_kw"]) if l["pac_medio_6_18_kw"] is not None else 0.0,
         })
     por_inversor = sorted(por_inv_map.values(), key=lambda x: x["idx"])
 
@@ -600,7 +601,8 @@ def anual(aaaa: str):
         SELECT i.idx, i.nome,
                EXTRACT(MONTH FROM r.data)::int AS mes,
                SUM(r.energia_kwh)              AS energia,
-               MAX(r.pico_kw)                  AS pico
+               MAX(r.pico_kw)                  AS pico,
+               AVG(r.pac_medio_6_18_kw)        AS pac_medio
         FROM resumo_dia_inversor r
         JOIN inversor i ON i.id = r.inversor_id
         WHERE r.data >= %s AND r.data < %s
@@ -614,9 +616,10 @@ def anual(aaaa: str):
         if nome not in por_inv_map:
             por_inv_map[nome] = {"idx": l["idx"], "nome": nome, "meses": []}
         por_inv_map[nome]["meses"].append({
-            "mes":         l["mes"],
-            "energia_kwh": float(l["energia"] or 0),
-            "pico_kw":     float(l["pico"] or 0),
+            "mes":          l["mes"],
+            "energia_kwh":  float(l["energia"] or 0),
+            "pico_kw":      float(l["pico"] or 0),
+            "pac_medio_kw": float(l["pac_medio"]) if l["pac_medio"] is not None else 0.0,
         })
     por_inversor = sorted(por_inv_map.values(), key=lambda x: x["idx"])
 
