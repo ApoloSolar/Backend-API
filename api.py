@@ -22,6 +22,16 @@ NOVIDADES DA v2:
        - reaproveita UMA conexao com o banco, em vez de
          abrir uma nova a cada chamada.
 
+NOVIDADES DESTA REVISAO (reducao de egress):
+  3. GZIP — comprime as respostas JSON (~80% menores). O
+     navegador descomprime sozinho; nenhum endpoint muda.
+  4. CACHE — adiciona Cache-Control: periodo ja encerrado
+     (dia/mes/ano passado) fica cacheado por 24h; periodo
+     atual, por 60s (o coletor so grava de 5 em 5 min). O
+     navegador para de rebaixar dados que nao mudaram.
+  5. RATE LIMIT — limita requisicoes por IP (corta picos de
+     bots/scanners sem afetar o dashboard).
+
 CREDENCIAIS: DATABASE_URL vem de variavel de ambiente.
 
 ENDERECOS:
@@ -41,8 +51,15 @@ import os
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from starlette.datastructures import MutableHeaders
+
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.errors import RateLimitExceeded
 
 import psycopg
 from psycopg.rows import dict_row
@@ -69,6 +86,110 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ============================================================
+# OTIMIZACOES DE EGRESS  (transparente — nao altera endpoints)
+# ============================================================
+# Reduz o trafego de rede sem mudar nenhuma resposta:
+#   - cache: o navegador para de rebaixar dados que nao mudaram
+#   - gzip: respostas JSON ~80% menores
+#   - rate limit: corta picos de bots/scanners por IP
+# A ordem de aplicacao deixa o rate limit por fora (rejeita bot
+# antes de gastar processamento), o gzip no meio e o cache por
+# dentro (so carimba o cabecalho).
+
+# Endpoints de "estado atual": cache curto (60s).
+_DINAMICOS = {"/ultimas", "/resumo", "/inversores", "/saude"}
+_CACHE_LONGO = "public, max-age=86400"   # 24h — periodo ja encerrado
+_CACHE_CURTO = "public, max-age=60"      # 60s — periodo atual / estado
+
+
+def _cache_para_caminho(caminho, agora):
+    """Decide o Cache-Control a partir do caminho da requisicao.
+    Compara a data/mes/ano pedido com o atual: periodo encerrado
+    recebe cache longo; periodo em andamento, cache curto.
+    Devolve a string de Cache-Control ou None (sem cache)."""
+    partes = caminho.strip("/").split("/")
+    if not partes or not partes[0]:
+        return None
+    try:
+        # /dia/AAAA-MM-DD   (e tambem .../canais, .../curva-inversores)
+        if partes[0] == "dia" and len(partes) >= 2:
+            d = datetime.strptime(partes[1], "%Y-%m-%d").date()
+            return _CACHE_LONGO if d < agora.date() else _CACHE_CURTO
+        # /mensal/AAAA-MM
+        if partes[0] == "mensal" and len(partes) >= 2:
+            ano, mes = partes[1].split("-")
+            if (int(ano), int(mes)) < (agora.year, agora.month):
+                return _CACHE_LONGO
+            return _CACHE_CURTO
+        # /anual/AAAA
+        if partes[0] == "anual" and len(partes) >= 2:
+            return _CACHE_LONGO if int(partes[1]) < agora.year else _CACHE_CURTO
+    except (ValueError, IndexError):
+        return None  # formato inesperado: nao mexe no cabecalho
+    if caminho in _DINAMICOS:
+        return _CACHE_CURTO
+    return None
+
+
+class CacheHeaderMiddleware:
+    """Middleware ASGI puro: apenas ADICIONA o cabecalho Cache-Control
+    nas respostas GET 200. Nunca le nem altera o corpo da resposta,
+    entao convive sem problemas com o GZip e o rate limit."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or scope.get("method") != "GET":
+            await self.app(scope, receive, send)
+            return
+        cc = _cache_para_caminho(scope.get("path", ""),
+                                 datetime.now(FUSO_BRASIL))
+        if cc is None:
+            await self.app(scope, receive, send)
+            return
+
+        async def send_wrapper(message):
+            if (message["type"] == "http.response.start"
+                    and message.get("status") == 200):
+                headers = MutableHeaders(raw=message["headers"])
+                headers["Cache-Control"] = cc
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+def _ip_cliente(request):
+    """IP real do cliente. Atras do proxy do Railway o IP verdadeiro
+    vem no cabecalho X-Forwarded-For; o request.client seria o proxy."""
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return get_remote_address(request)
+
+
+# 1) Cache (so adiciona cabecalho — ASGI puro)
+app.add_middleware(CacheHeaderMiddleware)
+
+# 2) GZip — comprime respostas a partir de 500 bytes
+app.add_middleware(GZipMiddleware, minimum_size=500)
+
+# 3) Rate limit por IP (300/min e folgado para o dashboard,
+#    apertado para bots). Ajuste se telas legitimas tomarem 429.
+limiter = Limiter(key_func=_ip_cliente, default_limits=["300/minute"])
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
+
+
+@app.exception_handler(RateLimitExceeded)
+def _limite_excedido(request, exc):
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "Muitas requisicoes. Tente novamente em instantes."},
+    )
 
 
 # ============================================================
