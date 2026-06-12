@@ -32,6 +32,15 @@ NOVIDADES DESTA REVISAO (reducao de egress):
   5. RATE LIMIT — limita requisicoes por IP (corta picos de
      bots/scanners sem afetar o dashboard).
 
+NOVIDADES DESTA REVISAO (multi-usina):
+  6. FILTRO POR USINA — as rotas do modo diario (/dia,
+     /dia/{data}/canais e /dia/{data}/curva-inversores)
+     aceitam o parametro de query ?usina=<slug> (default
+     "pk") e filtram as leituras por usina.slug. Sem isso a
+     API somava TODAS as usinas juntas (PK + Ibiracu), o que
+     contaminava os graficos de PK e fazia Ibiracu aparecer
+     com os dados de PK.
+
 CREDENCIAIS: DATABASE_URL vem de variavel de ambiente.
 
 ENDERECOS:
@@ -41,8 +50,12 @@ ENDERECOS:
   /inversores            -> inversores e contagem de leituras
   /ultimas               -> 20 leituras mais recentes
   /dia/{data}            -> resumo + curva do dia (AAAA-MM-DD)
+                            ?usina=<slug> (default "pk")
   /dia/{data}/canais     -> canais da leitura mais recente
                             de cada inversor naquele dia
+                            ?usina=<slug> (default "pk")
+  /dia/{data}/curva-inversores -> serie de pac_kw por inversor
+                            ?usina=<slug> (default "pk")
   /checagem              -> procura problemas nos dados
 ============================================================
 """
@@ -379,13 +392,16 @@ def ultimas():
 #   - a curva de potencia (soma de pac_kw por horario)
 #   - o resumo (pico, energia)
 # Assim trafega pouca coisa e a memoria nao estoura.
+#
+# MULTI-USINA: aceita ?usina=<slug> (default "pk") e filtra as
+# leituras por usina.slug, para nao somar usinas diferentes.
 
 @app.get("/dia/{data}")
-def dia(data: str):
-    """Resumo e curva de um dia (ex: /dia/2026-05-22)."""
+def dia(data: str, usina: str = "pk"):
+    """Resumo e curva de um dia (ex: /dia/2026-05-22?usina=ibiracu)."""
     inicio, fim = faixa_do_dia(data)
 
-    # Curva de potencia: soma de pac_kw por horario.
+    # Curva de potencia: soma de pac_kw por horario, SOMENTE desta usina.
     # O agrupamento e feito pelo banco; volta uma linha por horario
     # (no maximo ~288 por dia), nao milhares.
     curva = consultar("""
@@ -393,10 +409,13 @@ def dia(data: str):
                SUM(l.pac_kw)     AS pac_total,
                SUM(l.dyield_kwh) AS dyield_total
         FROM leitura l
-        WHERE l.data_hora >= %s AND l.data_hora < %s
+        JOIN inversor i ON i.id = l.inversor_id
+        JOIN usina u    ON u.id = i.usina_id
+        WHERE u.slug = %s
+          AND l.data_hora >= %s AND l.data_hora < %s
         GROUP BY l.data_hora
         ORDER BY l.data_hora
-    """, (inicio, fim))
+    """, (usina, inicio, fim))
 
     if not curva:
         return {"data": data, "aviso": "Nenhuma leitura neste dia.",
@@ -405,23 +424,29 @@ def dia(data: str):
     # Pico de potencia = maior soma instantanea
     pico = max((c["pac_total"] or 0.0) for c in curva)
 
-    # Energia do dia = maior dyield de cada inversor, somado.
+    # Energia do dia = maior dyield de cada inversor, somado (desta usina).
     # Tambem resumido pelo banco.
     energia = um("""
         SELECT COALESCE(SUM(maxdy), 0) AS total FROM (
             SELECT MAX(l.dyield_kwh) AS maxdy
             FROM leitura l
-            WHERE l.data_hora >= %s AND l.data_hora < %s
+            JOIN inversor i ON i.id = l.inversor_id
+            JOIN usina u    ON u.id = i.usina_id
+            WHERE u.slug = %s
+              AND l.data_hora >= %s AND l.data_hora < %s
             GROUP BY l.inversor_id
         ) sub
-    """, (inicio, fim))["total"]
+    """, (usina, inicio, fim))["total"]
 
-    # Quantos inversores reportaram neste dia
+    # Quantos inversores reportaram neste dia (desta usina)
     n_inv = um("""
-        SELECT COUNT(DISTINCT inversor_id) AS n
-        FROM leitura
-        WHERE data_hora >= %s AND data_hora < %s
-    """, (inicio, fim))["n"]
+        SELECT COUNT(DISTINCT l.inversor_id) AS n
+        FROM leitura l
+        JOIN inversor i ON i.id = l.inversor_id
+        JOIN usina u    ON u.id = i.usina_id
+        WHERE u.slug = %s
+          AND l.data_hora >= %s AND l.data_hora < %s
+    """, (usina, inicio, fim))["n"]
 
     # Formata os horarios da curva para o Brasil
     for c in curva:
@@ -450,14 +475,18 @@ def dia(data: str):
 # a sua ultima leitura do dia (cabecalho + canais MPPT +
 # canais string). Sao ~8 leituras, nao as ~2300 de um dia
 # inteiro. Isso elimina o estouro de memoria.
+#
+# MULTI-USINA: aceita ?usina=<slug> (default "pk") e filtra por
+# usina.slug, para nao misturar inversores de usinas diferentes
+# (PK e Ibiracu tem ambos "Inversor 1", "Inversor 2"...).
 
 @app.get("/dia/{data}/canais")
-def dia_canais(data: str):
+def dia_canais(data: str, usina: str = "pk"):
     """Canais da leitura mais recente de cada inversor no dia."""
     inicio, fim = faixa_do_dia(data)
 
-    # 1) Para cada inversor, acha o id da sua leitura mais recente
-    #    dentro do dia. DISTINCT ON resolve isso no banco.
+    # 1) Para cada inversor DESTA usina, acha o id da sua leitura mais
+    #    recente dentro do dia. DISTINCT ON resolve isso no banco.
     leituras = consultar("""
         SELECT DISTINCT ON (l.inversor_id)
                l.id, l.inversor_id, i.idx, i.nome AS inversor,
@@ -466,9 +495,11 @@ def dia_canais(data: str):
                l.freq_hz, l.tmod_c, l.tamb_c, l.iso_kohm, l.pdc_kw
         FROM leitura l
         JOIN inversor i ON i.id = l.inversor_id
-        WHERE l.data_hora >= %s AND l.data_hora < %s
+        JOIN usina u    ON u.id = i.usina_id
+        WHERE u.slug = %s
+          AND l.data_hora >= %s AND l.data_hora < %s
         ORDER BY l.inversor_id, l.data_hora DESC
-    """, (inicio, fim))
+    """, (usina, inicio, fim))
 
     if not leituras:
         return {"data": data, "aviso": "Nenhuma leitura neste dia.",
@@ -538,9 +569,13 @@ def dia_canais(data: str):
 # E um endereco LEVE: traz apenas data_hora + pac_kw (sem os
 # canais MPPT/string), entao sao algumas centenas de linhas,
 # nao dezenas de milhares. Nao ha risco de memoria.
+#
+# MULTI-USINA: aceita ?usina=<slug> (default "pk") e filtra por
+# usina.slug — senao a serie de "Inversor 1" misturaria PK e
+# Ibiracu (nomes iguais entre usinas).
 
 @app.get("/dia/{data}/curva-inversores")
-def dia_curva_inversores(data: str):
+def dia_curva_inversores(data: str, usina: str = "pk"):
     """Serie de pac_kw de cada inversor ao longo do dia."""
     inicio, fim = faixa_do_dia(data)
 
@@ -549,9 +584,11 @@ def dia_curva_inversores(data: str):
                l.data_hora, l.pac_kw
         FROM leitura l
         JOIN inversor i ON i.id = l.inversor_id
-        WHERE l.data_hora >= %s AND l.data_hora < %s
+        JOIN usina u    ON u.id = i.usina_id
+        WHERE u.slug = %s
+          AND l.data_hora >= %s AND l.data_hora < %s
         ORDER BY i.idx, l.data_hora
-    """, (inicio, fim))
+    """, (usina, inicio, fim))
 
     if not linhas:
         return {"data": data, "aviso": "Nenhuma leitura neste dia.",
