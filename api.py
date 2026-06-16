@@ -56,6 +56,10 @@ ENDERECOS:
                             ?usina=<slug> (default "pk")
   /dia/{data}/curva-inversores -> serie de pac_kw por inversor
                             ?usina=<slug> (default "pk")
+  /mensal/{aaaa-mm}      -> resumo do mes (le resumo_dia)
+                            ?usina=<slug> (default "pk")
+  /anual/{aaaa}          -> resumo do ano (agrega resumo_dia)
+                            ?usina=<slug> (default "pk")
   /checagem              -> procura problemas nos dados
 ============================================================
 """
@@ -620,8 +624,8 @@ def dia_curva_inversores(data: str, usina: str = "pk"):
 #                 (para o "grafico em 8" do dashboard)
 
 @app.get("/mensal/{aaaa_mm}")
-def mensal(aaaa_mm: str):
-    """Resumo de um mes (ex: /mensal/2026-05)."""
+def mensal(aaaa_mm: str, usina: str = "pk"):
+    """Resumo de um mes (ex: /mensal/2026-05). ?usina=<slug> (default 'pk')."""
     try:
         ano, mes = aaaa_mm.split("-")
         ano_i, mes_i = int(ano), int(mes)
@@ -638,13 +642,16 @@ def mensal(aaaa_mm: str):
                 1 if mes_i == 12 else mes_i + 1, 1)
 
     # ---- dias (curva do mes) ----
+    # MULTI-USINA: filtra resumo_dia pela usina; sem isso PK e Ibiracu
+    # seriam somados (resumo_dia tem uma linha por usina por dia).
     dias = consultar("""
-        SELECT data, energia_kwh, pac_medio_kw, pico_kw, pico_hora,
-               insolacao_h, inversores_no_dia
-        FROM resumo_dia
-        WHERE data >= %s AND data < %s
-        ORDER BY data
-    """, (inicio, fim))
+        SELECT rd.data, rd.energia_kwh, rd.pac_medio_kw, rd.pico_kw,
+               rd.pico_hora, rd.insolacao_h, rd.inversores_no_dia
+        FROM resumo_dia rd
+        JOIN usina u ON u.id = rd.usina_id
+        WHERE u.slug = %s AND rd.data >= %s AND rd.data < %s
+        ORDER BY rd.data
+    """, (usina, inicio, fim))
 
     if not dias:
         return {"mes": aaaa_mm, "aviso": "Nenhum resumo para este mes.",
@@ -671,9 +678,10 @@ def mensal(aaaa_mm: str):
                r.disponibilidade, r.pac_medio_6_18_kw
         FROM resumo_dia_inversor r
         JOIN inversor i ON i.id = r.inversor_id
-        WHERE r.data >= %s AND r.data < %s
+        JOIN usina u    ON u.id = i.usina_id
+        WHERE u.slug = %s AND r.data >= %s AND r.data < %s
         ORDER BY i.idx, r.data
-    """, (inicio, fim))
+    """, (usina, inicio, fim))
 
     por_inv_map = {}
     for l in por_inv_linhas:
@@ -714,8 +722,8 @@ def mensal(aaaa_mm: str):
 #   por_inversor: lista [{idx, nome, meses:[{mes,energia_kwh,pico_kw}]}]
 
 @app.get("/anual/{aaaa}")
-def anual(aaaa: str):
-    """Resumo de um ano (ex: /anual/2026)."""
+def anual(aaaa: str, usina: str = "pk"):
+    """Resumo de um ano (ex: /anual/2026). ?usina=<slug> (default 'pk')."""
     try:
         ano_i = int(aaaa)
     except (ValueError, TypeError):
@@ -727,18 +735,20 @@ def anual(aaaa: str):
     fim    = _date(ano_i + 1, 1, 1)
 
     # ---- meses (curva do ano) ----
-    # Agrega resumo_dia por mes
+    # Agrega resumo_dia por mes, filtrando pela usina.
     meses = consultar("""
-        SELECT EXTRACT(MONTH FROM data)::int AS mes,
-               SUM(energia_kwh)              AS energia,
-               MAX(pico_kw)                  AS pico,
-               SUM(insolacao_h)              AS insolacao,
-               COUNT(*)                      AS dias_com_dados
-        FROM resumo_dia
-        WHERE data >= %s AND data < %s
-        GROUP BY EXTRACT(MONTH FROM data)
+        SELECT EXTRACT(MONTH FROM rd.data)::int AS mes,
+               SUM(rd.energia_kwh)              AS energia,
+               MAX(rd.pico_kw)                  AS pico,
+               AVG(rd.pac_medio_kw)             AS pac_medio,
+               SUM(rd.insolacao_h)              AS insolacao,
+               COUNT(*)                         AS dias_com_dados
+        FROM resumo_dia rd
+        JOIN usina u ON u.id = rd.usina_id
+        WHERE u.slug = %s AND rd.data >= %s AND rd.data < %s
+        GROUP BY EXTRACT(MONTH FROM rd.data)
         ORDER BY mes
-    """, (inicio, fim))
+    """, (usina, inicio, fim))
 
     if not meses:
         return {"ano": aaaa, "aviso": "Nenhum dado para este ano.",
@@ -747,6 +757,8 @@ def anual(aaaa: str):
     for m in meses:
         m["energia_kwh"]    = float(m.pop("energia") or 0)
         m["pico_kw"]        = float(m.pop("pico") or 0)
+        pm = m.pop("pac_medio")
+        m["pac_medio_kw"]   = float(pm) if pm is not None else 0.0
         ins = m.pop("insolacao")
         m["insolacao_h"]    = float(ins) if ins is not None else None
         m["dias_com_dados"] = m["dias_com_dados"]
@@ -763,10 +775,11 @@ def anual(aaaa: str):
                AVG(r.pac_medio_6_18_kw)        AS pac_medio
         FROM resumo_dia_inversor r
         JOIN inversor i ON i.id = r.inversor_id
-        WHERE r.data >= %s AND r.data < %s
+        JOIN usina u    ON u.id = i.usina_id
+        WHERE u.slug = %s AND r.data >= %s AND r.data < %s
         GROUP BY i.idx, i.nome, EXTRACT(MONTH FROM r.data)
         ORDER BY i.idx, mes
-    """, (inicio, fim))
+    """, (usina, inicio, fim))
 
     por_inv_map = {}
     for l in por_inv_linhas:
