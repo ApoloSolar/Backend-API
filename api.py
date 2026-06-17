@@ -60,6 +60,8 @@ ENDERECOS:
                             ?usina=<slug> (default "pk")
   /anual/{aaaa}          -> resumo do ano (agrega resumo_dia)
                             ?usina=<slug> (default "pk")
+  /alarmes/{data}        -> alarmes do dia (Chint + falhas de leitura)
+                            ?usina=<slug> (default "pk")
   /checagem              -> procura problemas nos dados
 ============================================================
 """
@@ -804,6 +806,66 @@ def anual(aaaa: str, usina: str = "pk"):
         "meses": meses,
         "por_inversor": por_inversor,
     }
+
+
+# ============================================================
+# /alarmes/{data}  — Chint + falhas de leitura do coletor
+# ============================================================
+
+@app.get("/alarmes/{data}")
+def alarmes(data: str, usina: str = "pk"):
+    """Alarmes de um dia. Une os alarmes da Chint (pontuais, por
+    'ocorrido_em') com os episodios de falha de leitura do coletor
+    (que cruzam o dia). ?usina=<slug> (default 'pk')."""
+    inicio, fim = faixa_do_dia(data)
+
+    linhas = consultar("""
+        SELECT a.origem, a.error_type, a.codigo, a.descricao,
+               a.device_sn, a.ocorrido_em, a.inicio_em, a.fim_em,
+               a.checked, a.ocorrencias, i.nome AS inversor_nome
+        FROM alarmes a
+        JOIN usina u         ON u.id = a.usina_id
+        LEFT JOIN inversor i ON i.id = a.inversor_id
+        WHERE u.slug = %s
+          AND (
+            (a.origem = 'chint'   AND a.ocorrido_em >= %s AND a.ocorrido_em < %s)
+            OR
+            (a.origem = 'coletor' AND a.inicio_em < %s
+                                  AND (a.fim_em IS NULL OR a.fim_em >= %s))
+          )
+        ORDER BY COALESCE(a.ocorrido_em, a.inicio_em) DESC
+    """, (usina, inicio, fim, fim, inicio))
+
+    out = []
+    for l in linhas:
+        inv = l["inversor_nome"] or l["device_sn"] or "Inversor"
+        if l["origem"] == "coletor":
+            out.append({
+                "origem":      "coletor",
+                "inversor":    inv,
+                "rotulo":      "INTERNET",
+                "titulo":      "Falha de leitura",
+                "descricao":   "Sem leitura no periodo — possivel queda de "
+                               "internet na usina.",
+                "inicio":      fmt(l["inicio_em"]),
+                "fim":         fmt(l["fim_em"]),
+                "checked":     bool(l["checked"]),
+                "ocorrencias": l["ocorrencias"] or 1,
+            })
+        else:
+            out.append({
+                "origem":      "chint",
+                "inversor":    inv,
+                "rotulo":      l["error_type"] or "ERRO",
+                "titulo":      l["codigo"] or "",
+                "descricao":   l["descricao"] or "",
+                "inicio":      fmt(l["ocorrido_em"]),
+                "fim":         None,
+                "checked":     bool(l["checked"]),
+                "ocorrencias": l["ocorrencias"] or 1,
+            })
+
+    return {"data": data, "usina": usina, "total": len(out), "alarmes": out}
 
 
 # ============================================================
