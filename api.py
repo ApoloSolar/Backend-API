@@ -494,6 +494,7 @@ def dia_canais(data: str, usina: str = "pk"):
     leituras = consultar("""
         SELECT DISTINCT ON (l.inversor_id)
                l.id, l.inversor_id, i.idx, i.nome AS inversor,
+               i.serial_sn,
                l.data_hora, l.status,
                l.pac_kw, l.dyield_kwh, l.tyield_kwh,
                l.freq_hz, l.tmod_c, l.tamb_c, l.iso_kohm, l.pdc_kw
@@ -547,6 +548,7 @@ def dia_canais(data: str, usina: str = "pk"):
         saida.append({
             "idx": l["idx"],
             "inversor": l["inversor"],
+            "serial_sn": l["serial_sn"],
             "data_hora": fmt(l["data_hora"]),
             "status": l["status"],
             "pac_kw": l["pac_kw"],
