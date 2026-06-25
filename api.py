@@ -497,12 +497,14 @@ def dia_canais(data: str, usina: str = "pk"):
         SELECT DISTINCT ON (l.inversor_id)
                l.id, l.inversor_id, i.idx, i.nome AS inversor,
                i.serial_sn,
+               m.nome AS modelo,
                l.data_hora, l.status,
                l.pac_kw, l.dyield_kwh, l.tyield_kwh,
                l.freq_hz, l.tmod_c, l.tamb_c, l.iso_kohm, l.pdc_kw
         FROM leitura l
         JOIN inversor i ON i.id = l.inversor_id
         JOIN usina u    ON u.id = i.usina_id
+        LEFT JOIN modelo_inversor m ON m.id = i.modelo_id
         WHERE u.slug = %s
           AND l.data_hora >= %s AND l.data_hora < %s
         ORDER BY l.inversor_id, l.data_hora DESC
@@ -551,6 +553,7 @@ def dia_canais(data: str, usina: str = "pk"):
             "idx": l["idx"],
             "inversor": l["inversor"],
             "serial_sn": l["serial_sn"],
+            "modelo": l["modelo"],
             "data_hora": fmt(l["data_hora"]),
             "status": l["status"],
             "pac_kw": l["pac_kw"],
