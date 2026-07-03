@@ -60,6 +60,11 @@ ENDERECOS:
                             ?usina=<slug> (default "pk")
   /anual/{aaaa}          -> resumo do ano (agrega resumo_dia)
                             ?usina=<slug> (default "pk")
+  /pvsyst                -> previsao do PVsyst: ano 1 mes a mes +
+                            projecao dos 25 anos com depreciacao
+                            ?usina=<slug> (default "pk")
+  /pvsyst/{aaaa}         -> previsao de um ano (12 meses)
+  /pvsyst/{aaaa-mm}      -> previsao de um mes
   /alarmes/{data}        -> alarmes do dia (Chint + falhas de leitura)
                             ?usina=<slug> (default "pk")
   /checagem              -> procura problemas nos dados
@@ -146,6 +151,9 @@ def _cache_para_caminho(caminho, agora):
         # /anual/AAAA
         if partes[0] == "anual" and len(partes) >= 2:
             return _CACHE_LONGO if int(partes[1]) < agora.year else _CACHE_CURTO
+        # /pvsyst e /pvsyst/... — dado de projeto, estatico: cache longo
+        if partes[0] == "pvsyst":
+            return _CACHE_LONGO
     except (ValueError, IndexError):
         return None  # formato inesperado: nao mexe no cabecalho
     if caminho in _DINAMICOS:
@@ -270,7 +278,7 @@ def faixa_do_dia(data):
 
 
 # ============================================================
-# PVSYST — GERACAO DO 1o ANO E DEPRECIACAO ANO A ANO, POR USINA
+# PVSYST — GERACAO DO 1o ANO E DEPRECIACAO ACUMULADA, POR USINA
 # ============================================================
 # Dado de PROJETO (nao vem do banco). UMA entrada por usina —
 # basta trocar os numeros abaixo pelos do seu relatorio. Sao
@@ -279,46 +287,53 @@ def faixa_do_dia(data):
 #   inicio_ano / inicio_mes : quando a usina entrou em operacao.
 #                             O "ano 1" comeca aqui; antes disso
 #                             nao ha previsao (o KPI some).
-#   mensal_kwh   : geracao P50 do 1o ANO, MES A MES [Jan..Dez].
+#   mensal_kwh   : geracao do 1o ANO, MES A MES [Jan..Dez], em kWh.
 #                  Define o total do ano 1 e o "formato" sazonal.
-#   depr_pct     : DEPRECIACAO de cada ano de operacao (1..25),
-#                  ANO A ANO (cada ano tem a sua). E acumulada:
-#                  a geracao do ano N = geracao_ano1 x
-#                  (1-depr[1]) x (1-depr[2]) x ... x (1-depr[N]).
-#                  O ano 1 costuma ser 0 (referencia = mensal_kwh).
+#   depr_pct     : DEPRECIACAO ACUMULADA (em %) de cada ano de
+#                  operacao (1..25) — a perda TOTAL ate aquele ano,
+#                  como no relatorio PVsyst. Ex: [0.3, 0.91, 1.52,
+#                  ... 14.86] = perde 0,3% no ano 1, 0,91% acumulado
+#                  no ano 2, ..., 14,86% acumulado no ano 25.
 #                  Se a lista tiver menos de 25, repete o ultimo.
 #
-# O total anual NAO e digitado: sai da depreciacao acumulada.
-# O esperado de um mes = geracao_do_ano x (fracao sazonal do mes),
-# entao o ano 1 reproduz mensal_kwh e os anos 2..25 usam a mesma
-# curva, ja depreciada.
+# Calculo: a retencao de um ano N = (1 - depr[N]/100) normalizada
+# pelo ano 1, de modo que o ano 1 reproduz exatamente mensal_kwh.
+# A geracao do ano N = total_ano1 x retencao(N). O total anual NAO
+# e digitado: sai da depreciacao. O esperado de um mes = geracao do
+# ano x (fracao sazonal do mes).
 #
 # >>> SUBSTITUA OS VALORES ABAIXO PELOS DO SEU PVSYST <<<
 PVSYST = {
     "pk": {
         "inicio_ano": 2025,
         "inicio_mes": 1,
-        # 1o ano, mes a mes (Jan..Dez):
+        # 1o ano, mes a mes (Jan..Dez), em kWh:
         "mensal_kwh": [392983, 375807, 363562, 341975, 323329, 299453,
                        326168, 338136, 351180, 350404, 327990, 381595],
-        # Depreciacao de cada ano 1..25 (uma por ano — troque pela
-        # curva do seu relatorio; ano 1 = 0 pois mensal_kwh ja e o ano 1):
+        # Depreciacao ACUMULADA (%) de cada ano 1..25 (perda total ate o ano):
         "depr_pct": [
             #  ano1   ano2   ano3   ano4   ano5
-            0.3, 0.91, 1.52, 2.13, 2.74,   # anos  1–5
-           3.35, 3.95, 4.56, 5.17, 5.63,   # anos  6–10
-            6.09, 6.55, 7.01, 7.47, 7.93,   # anos 11–15
-            8.38, 8.84, 9.6, 10.35, 11.10,   # anos 16–20
-            11.85, 12.6, 13.35, 14.11, 14.86,   # anos 21–25
+             0.30,  0.91,  1.52,  2.13,  2.74,   # anos  1–5
+             3.35,  3.95,  4.56,  5.17,  5.63,   # anos  6–10
+             6.09,  6.55,  7.01,  7.47,  7.93,   # anos 11–15
+             8.38,  8.84,  9.60, 10.35, 11.10,   # anos 16–20
+            11.85, 12.60, 13.35, 14.11, 14.86,   # anos 21–25
         ],
     },
     "ibiracu": {
         "inicio_ano": 2025,
         "inicio_mes": 1,
+        # >>> EXEMPLO — troque pelos valores reais do PVsyst de Ibiracu <<<
         "mensal_kwh": [15000, 13500, 14200, 12800, 11300, 10300,
                        10800, 12300, 13200, 14700, 15200, 15400],
-        # Mesmo formato de pk (25 valores, ano a ano):
-        "depr_pct": [0.0, 0.02] + [0.006] * 8 + [0.005] * 10 + [0.004] * 5,
+        # Depreciacao ACUMULADA (%). Exemplo com a mesma curva de PK:
+        "depr_pct": [
+             0.30,  0.91,  1.52,  2.13,  2.74,
+             3.35,  3.95,  4.56,  5.17,  5.63,
+             6.09,  6.55,  7.01,  7.47,  7.93,
+             8.38,  8.84,  9.60, 10.35, 11.10,
+            11.85, 12.60, 13.35, 14.11, 14.86,
+        ],
     },
     # "linhares": { ... },   # ainda sem previsao — o KPI some p/ esta usina
 }
@@ -336,27 +351,28 @@ def _shape_mensal(cfg):
     return [v / tot for v in cfg["mensal_kwh"]]
 
 
-def _total_ano(cfg, n):
-    """Geracao anual do ano de operacao n (0-based), derivada da
-    DEPRECIACAO acumulada: total_ano1 x produto de (1 - depr) dos anos
-    1..(n+1). Se a lista de depreciacao acabar, repete o ultimo valor.
-    (Opcional: se a usina tiver 'anual_kwh', usa esse valor no lugar.)"""
-    anual = cfg.get("anual_kwh")          # override opcional
-    if anual:
-        return anual[n] if n < len(anual) else anual[-1]
-    base = sum(cfg["mensal_kwh"])         # total do ano 1
+def _retencao_ano(cfg, n):
+    """Retencao (fracao 0..1) do ano de operacao n (0-based), a partir da
+    DEPRECIACAO ACUMULADA (em %). Normaliza pelo ano 1 para que o ano 1
+    reproduza mensal_kwh (retencao 1,0)."""
     depr = cfg.get("depr_pct") or [0.0]
-    fator = 1.0
-    for i in range(n + 1):                # aplica a depreciacao dos anos 1..(n+1)
-        fator *= (1 - (depr[i] if i < len(depr) else depr[-1]))
-    return base * fator
+    d_n = (depr[n] if n < len(depr) else depr[-1]) / 100.0
+    d_1 = depr[0] / 100.0
+    base = 1.0 - d_1
+    return (1.0 - d_n) / base if base else (1.0 - d_n)
+
+
+def _total_ano(cfg, n):
+    """Geracao anual do ano de operacao n (0-based) = total do ano 1 x a
+    retencao daquele ano (derivada da depreciacao acumulada)."""
+    return sum(cfg["mensal_kwh"]) * _retencao_ano(cfg, n)
 
 
 def pvsyst_esperado(usina, ano, mes=None):
     """Geracao esperada pelo PVsyst (kWh) para a usina.
     mes=1..12 devolve aquele mes; mes=None soma o ano inteiro (mes a mes,
-    respeitando inicio de operacao e a depreciacao ano a ano). None se a
-    usina nao tem PVsyst cadastrado."""
+    respeitando inicio de operacao e a depreciacao). None se a usina nao
+    tem PVsyst cadastrado."""
     cfg = PVSYST.get(usina)
     if not cfg:
         return None
@@ -385,7 +401,8 @@ def bloco_pvsyst(usina, ano, mes, realizado_kwh):
         "realizado_kwh":   realizado_kwh,
         "performance_pct": round(realizado_kwh / esperado * 100, 1),
     }
-    # Contexto do periodo (so no modo mensal): ano de operacao e depreciacao.
+    # Contexto do periodo (so no modo mensal): ano de operacao e depreciacao
+    # ACUMULADA (%) daquele ano.
     cfg = PVSYST.get(usina)
     if cfg and mes is not None:
         n = _ano_operacao(cfg, ano, mes)
@@ -393,8 +410,7 @@ def bloco_pvsyst(usina, ano, mes, realizado_kwh):
             out["ano_operacao"] = n + 1
             depr = cfg.get("depr_pct")
             if depr:
-                out["depr_ano_pct"] = round(
-                    (depr[n] if n < len(depr) else depr[-1]) * 100, 2)
+                out["depr_acum_pct"] = depr[n] if n < len(depr) else depr[-1]
     return out
 
 
@@ -420,6 +436,10 @@ def inicio():
             ex: <a href="/dia/{hoje}">/dia/{hoje}</a></li>
         <li>/dia/<b>AAAA-MM-DD</b>/canais &mdash;
             ex: <a href="/dia/{hoje}/canais">/dia/{hoje}/canais</a></li>
+        <li><a href="/pvsyst">/pvsyst</a> &mdash; previsao do PVsyst (25 anos)
+            &middot; <code>?usina=&lt;slug&gt;</code></li>
+        <li>/pvsyst/<b>AAAA</b> ou /pvsyst/<b>AAAA-MM</b> &mdash; previsao de
+            um ano ou mes</li>
       </ul>
       <p><a href="/docs">/docs</a> &mdash; documentacao interativa</p>
     </body></html>
@@ -941,6 +961,111 @@ def anual(aaaa: str, usina: str = "pk"):
         },
         "meses": meses,
         "por_inversor": por_inversor,
+    }
+
+
+# ============================================================
+# /pvsyst  e  /pvsyst/{periodo}  — PREVISAO DO PVSYST
+# ============================================================
+# Expoem a previsao de projeto (nao vem do banco). Sao os mesmos
+# numeros usados no KPI "Geracao vs PVsyst", agora acessiveis por
+# URL propria:
+#   /pvsyst?usina=<slug>            -> previsao completa (ano 1 mes a
+#                                      mes + projecao dos 25 anos com
+#                                      depreciacao)
+#   /pvsyst/{AAAA}?usina=<slug>     -> os 12 meses previstos de um ano
+#   /pvsyst/{AAAA-MM}?usina=<slug>  -> o previsto de um mes
+# ?usina=<slug> (default "pk").
+
+@app.get("/pvsyst")
+def pvsyst(usina: str = "pk"):
+    """Previsao completa do PVsyst para a usina: geracao do 1o ano mes a
+    mes e a projecao ano a ano (1..25) ja com a depreciacao acumulada."""
+    cfg = PVSYST.get(usina)
+    if not cfg:
+        return {"usina": usina, "projecao": [],
+                "aviso": "Sem previsao PVsyst cadastrada para esta usina."}
+
+    mensal      = cfg["mensal_kwh"]
+    total_ano1  = round(sum(mensal), 2)
+    depr        = cfg.get("depr_pct") or [0.0]
+    n_anos      = max(len(depr), 25)
+
+    projecao = []
+    for n in range(n_anos):
+        total = _total_ano(cfg, n)
+        d = depr[n] if n < len(depr) else depr[-1]
+        # ano-calendario em que aquele ano de operacao comeca
+        m0 = cfg["inicio_ano"] * 12 + (cfg["inicio_mes"] - 1) + n * 12
+        projecao.append({
+            "ano_operacao":   n + 1,
+            "ano_calendario": m0 // 12,
+            "depr_acum_pct":  round(d, 3),   # depreciacao acumulada (%) do ano
+            "retencao_pct":   round(total / total_ano1 * 100, 2) if total_ano1 else None,
+            "esperado_kwh":   round(total, 2),
+        })
+
+    return {
+        "usina":            usina,
+        "inicio":           f"{cfg['inicio_ano']:04d}-{cfg['inicio_mes']:02d}",
+        "ano1_total_kwh":   total_ano1,
+        "ano1_mensal_kwh":  [round(v, 2) for v in mensal],
+        "anos":             n_anos,
+        "projecao":         projecao,
+    }
+
+
+@app.get("/pvsyst/{periodo}")
+def pvsyst_periodo(periodo: str, usina: str = "pk"):
+    """Previsao do PVsyst de um periodo: AAAA (ano, 12 meses) ou AAAA-MM
+    (um mes). ?usina=<slug> (default 'pk')."""
+    cfg = PVSYST.get(usina)
+    if not cfg:
+        return {"usina": usina, "periodo": periodo,
+                "aviso": "Sem previsao PVsyst cadastrada para esta usina."}
+
+    # ---- AAAA-MM: um mes ----
+    if "-" in periodo:
+        try:
+            ano_s, mes_s = periodo.split("-")
+            ano_i, mes_i = int(ano_s), int(mes_s)
+            if not (1 <= mes_i <= 12):
+                raise ValueError
+        except ValueError:
+            raise HTTPException(status_code=400,
+                                detail="Formato invalido. Use AAAA-MM ou AAAA.")
+        n = _ano_operacao(cfg, ano_i, mes_i)
+        return {
+            "usina":         usina,
+            "periodo":       periodo,
+            "ano_operacao":  (n + 1) if n >= 0 else None,
+            "esperado_kwh":  pvsyst_esperado(usina, ano_i, mes_i),
+        }
+
+    # ---- AAAA: o ano inteiro, mes a mes ----
+    try:
+        ano_i = int(periodo)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400,
+                            detail="Formato invalido. Use AAAA-MM ou AAAA.")
+
+    NOMES_MES = ["", "Jan", "Fev", "Mar", "Abr", "Mai", "Jun",
+                 "Jul", "Ago", "Set", "Out", "Nov", "Dez"]
+    meses = []
+    for m in range(1, 13):
+        n = _ano_operacao(cfg, ano_i, m)
+        meses.append({
+            "mes":           m,
+            "rotulo":        NOMES_MES[m],
+            "ano_operacao":  (n + 1) if n >= 0 else None,
+            "esperado_kwh":  pvsyst_esperado(usina, ano_i, m),
+        })
+    total = round(sum(x["esperado_kwh"] or 0 for x in meses), 2)
+    return {
+        "usina":            usina,
+        "ano":              periodo,
+        "esperado_ano_kwh": total,
+        "meses":            meses,
     }
 
 
