@@ -325,7 +325,7 @@ PVSYST = {
         "inicio_mes": 1,
         # >>> EXEMPLO — troque pelos valores reais do PVsyst de Ibiracu <<<
         "mensal_kwh": [198868, 179872, 185906, 161928, 150725, 149062,
-                       60000, 160086, 160605, 164836, 160566, 184432],
+                       153683, 160086, 160605, 164836, 160566, 184432],
         # Depreciacao ACUMULADA (%). Exemplo com a mesma curva de PK:
         "depr_pct": [
              0.25,  0.76,  1.27,  1.77,  2.28,
