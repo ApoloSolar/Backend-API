@@ -74,7 +74,7 @@ ENDERECOS:
 import os
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -253,6 +253,18 @@ def um(sql, params=()):
     """Atalho: executa um SELECT e devolve apenas a primeira linha."""
     linhas = consultar(sql, params)
     return linhas[0] if linhas else None
+
+
+def executar(sql, params=()):
+    """Executa INSERT/DELETE/UPDATE e faz commit. Usa o pool."""
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+            conn.commit()
+    except Exception as e:
+        raise HTTPException(status_code=500,
+                            detail=f"Erro ao gravar no banco: {e}")
 
 
 def fmt(dt):
@@ -1092,6 +1104,11 @@ def alarmes(data: str, usina: str = "pk"):
                                   AND a.inicio_em < %s
                                   AND (a.fim_em IS NULL OR a.fim_em >= %s))
           )
+          AND NOT EXISTS (
+            SELECT 1 FROM alarme_silencio s
+            WHERE (s.origem = 'any' OR s.origem = a.origem)
+              AND s.codigo = a.codigo
+          )
         ORDER BY COALESCE(a.ocorrido_em, a.inicio_em) DESC
     """, (usina, inicio, fim, fim, inicio))
 
@@ -1137,6 +1154,142 @@ def alarmes(data: str, usina: str = "pk"):
             })
 
     return {"data": data, "usina": usina, "total": len(out), "alarmes": out}
+
+
+# ============================================================
+# /silencios  — silenciar tipos de alarme (por origem + codigo)
+# ============================================================
+# Uma regra silencia um CODIGO de alarme (opcionalmente so de uma
+# origem). O /alarmes ja sai filtrado, entao vale para o dashboard
+# E para o alerta do WhatsApp ao mesmo tempo.
+
+_ORIGENS_SILENCIO = {"any", "chint", "solis", "canadian", "coletor"}
+
+
+@app.get("/silencios/lista")
+def silencios_lista():
+    linhas = consultar(
+        "SELECT id, origem, codigo, criado_em FROM alarme_silencio "
+        "ORDER BY criado_em DESC"
+    )
+    return {"silencios": [
+        {"id": l["id"], "origem": l["origem"], "codigo": l["codigo"],
+         "criado_em": fmt(l["criado_em"])}
+        for l in linhas
+    ]}
+
+
+@app.post("/silencios/add")
+async def silencios_add(request: Request):
+    body = await request.json()
+    origem = str(body.get("origem") or "any").strip().lower()
+    codigo = str(body.get("codigo") or "").strip()
+    if origem not in _ORIGENS_SILENCIO:
+        raise HTTPException(400, "origem invalida.")
+    if not codigo:
+        raise HTTPException(400, "codigo vazio.")
+    executar(
+        "INSERT INTO alarme_silencio (origem, codigo) VALUES (%s, %s) "
+        "ON CONFLICT (origem, codigo) DO NOTHING",
+        (origem, codigo),
+    )
+    return {"ok": True}
+
+
+@app.post("/silencios/remover")
+async def silencios_remover(request: Request):
+    body = await request.json()
+    sid = body.get("id")
+    if not sid:
+        raise HTTPException(400, "id vazio.")
+    executar("DELETE FROM alarme_silencio WHERE id = %s", (sid,))
+    return {"ok": True}
+
+
+@app.get("/silencios", response_class=HTMLResponse)
+def silencios_pagina():
+    return """<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Alarmes silenciados — Apolo Solar</title>
+<style>
+  body{font-family:system-ui,Arial,sans-serif;max-width:640px;margin:24px auto;
+       padding:0 16px;color:#1a2a3a}
+  h1{font-size:20px}
+  .card{border:1px solid #dbe3ea;border-radius:10px;padding:16px;margin:16px 0}
+  label{display:block;font-size:13px;color:#5a6a7a;margin:8px 0 4px}
+  select,input{width:100%;padding:9px;border:1px solid #cdd7e1;border-radius:8px;
+       font-size:15px;box-sizing:border-box}
+  button{padding:9px 14px;border:0;border-radius:8px;font-size:14px;cursor:pointer}
+  .add{background:#0b7;color:#fff;margin-top:12px}
+  .del{background:#e55;color:#fff;padding:6px 10px;font-size:13px}
+  table{width:100%;border-collapse:collapse;margin-top:8px}
+  td,th{text-align:left;padding:8px;border-bottom:1px solid #eef2f6;font-size:14px}
+  .tag{background:#eef2f6;border-radius:6px;padding:2px 8px;font-size:12px}
+  .vazio{color:#8a9aaa;font-style:italic}
+</style></head><body>
+<h1>Alarmes silenciados</h1>
+<p>Silencie um <b>código</b> de alarme. Vale para o dashboard e para o alerta do WhatsApp.
+Os outros alarmes do inversor continuam ativos.</p>
+
+<div class="card">
+  <label>Fabricante</label>
+  <select id="origem">
+    <option value="any">Qualquer</option>
+    <option value="chint">Chint</option>
+    <option value="solis">Solis</option>
+    <option value="canadian">Canadian</option>
+    <option value="coletor">Coletor (internet)</option>
+  </select>
+  <label>Código do alarme</label>
+  <input id="codigo" placeholder="ex.: 2701" />
+  <button class="add" onclick="adicionar()">Silenciar</button>
+</div>
+
+<div class="card">
+  <b>Silenciados</b>
+  <table><tbody id="lista"></tbody></table>
+</div>
+
+<script>
+async function carregar(){
+  const r = await fetch('/silencios/lista');
+  const d = await r.json();
+  const tb = document.getElementById('lista');
+  tb.innerHTML = '';
+  if(!d.silencios.length){
+    tb.innerHTML = '<tr><td class="vazio">Nenhum alarme silenciado.</td></tr>';
+    return;
+  }
+  for(const s of d.silencios){
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      '<td><span class="tag">'+s.origem+'</span></td>'+
+      '<td>código <b>'+s.codigo+'</b></td>'+
+      '<td style="text-align:right"><button class="del">remover</button></td>';
+    tr.querySelector('button').onclick = () => remover(s.id);
+    tb.appendChild(tr);
+  }
+}
+async function adicionar(){
+  const origem = document.getElementById('origem').value;
+  const codigo = document.getElementById('codigo').value.trim();
+  if(!codigo){ alert('Informe o código.'); return; }
+  await fetch('/silencios/add', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({origem, codigo})});
+  document.getElementById('codigo').value = '';
+  carregar();
+}
+async function remover(id){
+  await fetch('/silencios/remover', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id})});
+  carregar();
+}
+carregar();
+</script>
+</body></html>"""
 
 
 # ============================================================
